@@ -2,7 +2,7 @@
 # deps: numpy, scipy, h5py, k-wave-python
 import os
 import numpy as np
-from scipy.io import loadmat, savemat
+from scipy.io import savemat
 
 # ---- k-Wave-python API (정식 네임스페이스) ----
 from kwave.kgrid import kWaveGrid
@@ -33,7 +33,7 @@ pitch_mm, elem_w_mm = 0.30, 0.25
 p_amp = 1e5                   # [Pa]
 
 # 파일·폴더
-INPUTS_MAT_DIR = "./DATA/inputs_mat"
+INPUTS_NPY_DIR = "./00"
 OUT_RF_DIR = "./ouputs/out_rf"
 os.makedirs(OUT_RF_DIR, exist_ok=True)
 
@@ -203,182 +203,187 @@ def run2d(kgrid, source, sensor, medium, sim_opts, exec_opts):
 
 # -------------------------- main --------------------------
 def main():
-    # === HU 불러오기 (첫 파일) ===
-    mats = sorted([f for f in os.listdir(INPUTS_MAT_DIR) if f.endswith(".mat")])
-    assert mats, f"입력 폴더 {INPUTS_MAT_DIR} 에 .mat 파일이 없습니다."
-    mat_path = os.path.join(INPUTS_MAT_DIR, mats[0])
-    S = loadmat(mat_path)
-    assert 'skull' in S, f"{mat_path} 에 'skull' 없음"
-    skull = S['skull'].astype(np.float32)
+    # Recursively collect all .npy files under INPUTS_NPY_DIR
+    npy_files = []
+    for root, _, files in os.walk(INPUTS_NPY_DIR):
+        for f in files:
+            if f.endswith(".npy"):
+                npy_files.append(os.path.join(root, f))
+    npy_files = sorted(npy_files)
+    assert npy_files, f"입력 폴더 {INPUTS_NPY_DIR} 하위에 .npy 파일이 없습니다."
 
-    Nx = int(round(Lx_cm / (gs_mm/10.0)))
-    Ny = int(round(Ly_cm / (gs_mm/10.0)))
-    assert skull.shape == (Nx, Ny), f"skull 크기 {skull.shape} != ({Nx},{Ny})"
-    print(f"Loaded {mat_path}  size={skull.shape}")
+    for npy_path in npy_files:
+        skull = np.load(npy_path).astype(np.float32)
 
-    dx = dy = gs_mm * 1e-3
+        Nx = int(round(Lx_cm / (gs_mm/10.0)))
+        Ny = int(round(Ly_cm / (gs_mm/10.0)))
+        assert skull.shape == (Nx, Ny), f"skull 크기 {skull.shape} != ({Nx},{Ny})"
+        print(f"Loaded {npy_path}  size={skull.shape}")
 
-    # === Grid ===
-    kgrid = kWaveGrid((Nx, Ny), (dx, dy))
+        dx = dy = gs_mm * 1e-3
 
-    # === Medium ===
-    skull_clipped = skull.copy()
-    skull_clipped[skull_clipped < 25] = 0.0
-    density_map = hounsfield2density(skull_clipped)
-    density_map[density_map < 997.0] = 997.0
-    velocity_map = 1.33 * density_map + 167.0
+        # === Grid ===
+        kgrid = kWaveGrid((Nx, Ny), (dx, dy))
 
-    attenuation_map = np.full((Nx, Ny), 0.53, dtype=np.float32)
-    attenuation_map[skull_clipped > 100.0] = 13.3
+        # === Medium ===
+        skull_clipped = skull.copy()
+        skull_clipped[skull_clipped < 25] = 0.0
+        density_map = hounsfield2density(skull_clipped)
+        density_map[density_map < 997.0] = 997.0
+        velocity_map = 1.33 * density_map + 167.0
 
-    medium = kWaveMedium(
-        sound_speed=velocity_map.astype(np.float32),
-        density=density_map.astype(np.float32),
-        alpha_coeff=attenuation_map.astype(np.float32),
-        alpha_power=1.5
-    )
+        attenuation_map = np.full((Nx, Ny), 0.53, dtype=np.float32)
+        attenuation_map[skull_clipped > 100.0] = 13.3
 
-    # === 배열 마스크 ===
-    pitch_pix  = max(1, int(round(pitch_mm/gs_mm)))
-    elem_w_pix = max(1, int(round(elem_w_mm/gs_mm)))
-    td_x = int(round(td_loc[0] / (gs_mm/10.0)))
-    y_center = int(round(td_loc[1] / (gs_mm/10.0)))
-    array_mask, elem_cols, yc = makeLinearArrayMask(Nx, Ny, td_x, y_center, n_e, elem_w_pix, pitch_pix)
-
-    # === 시간 옵션 ===
-    c0 = float(np.min(velocity_map))
-    CFL = 0.10
-    depth_m = Lx_cm * 1e-2
-    t_end = 2*depth_m/c0 * 1.2
-
-    # --- Define time array using kgrid ---
-    kgrid.makeTime(c0, CFL, t_end)
-    dt_actual = float(kgrid.dt)
-    Nt_actual = int(kgrid.Nt)
-
-    sim_opts = SimulationOptions(
-        pml_inside=False,
-        pml_size=14,
-        pml_alpha=5.0,
-        data_cast=device,
-        save_to_disk=True
-    )
-    exec_opts = SimulationExecutionOptions(is_gpu_simulation=True)
-
-    # === MB 트랙 ===
-    # Spawn & move **only** where HU==0 (after clipping, this is water/soft).
-    mask_water_spawn = (skull_clipped == 0.0)
-    K = 100  # adjust as needed
-    tracks = make_mb_tracks_rand_avoid_bone(
-        mask_water_spawn, T, K, rng=np.random.default_rng(1234)
-    )
-
-    # (dt_actual, Nt_actual are now defined from kgrid.makeTime)
-
-    # === 프레임/각도 루프 ===
-    for t in range(1, T+1):
-        # Use physical gas-like bubbles with soft edge (defaults ~1 px radius, 0.75 px ramp)
-        c_t, rho_t = apply_mb_disks_physical(velocity_map, density_map, tracks[t-1])
-
-        # Note: Very large K or r_pix may cause strong reflections at simulation boundaries.
-        medium_t = kWaveMedium(
-            sound_speed=c_t.astype(np.float32),
-            density=rho_t.astype(np.float32),
+        medium = kWaveMedium(
+            sound_speed=velocity_map.astype(np.float32),
+            density=density_map.astype(np.float32),
             alpha_coeff=attenuation_map.astype(np.float32),
             alpha_power=1.5
         )
 
-        for th in angles:
-            # --- Build fresh source/sensor each run (k-Wave mutates masks) ---
-            source = kSource()
-            # ensure mask has correct shape and Fortran layout; dtype must be boolean
-            amask = array_mask
-            if amask.shape != (kgrid.Nx, kgrid.Ny):
-                if amask.shape == (kgrid.Ny, kgrid.Nx):
-                    amask = amask.T
+        # === 배열 마스크 ===
+        pitch_pix  = max(1, int(round(pitch_mm/gs_mm)))
+        elem_w_pix = max(1, int(round(elem_w_mm/gs_mm)))
+        td_x = int(round(td_loc[0] / (gs_mm/10.0)))
+        y_center = int(round(td_loc[1] / (gs_mm/10.0)))
+        array_mask, elem_cols, yc = makeLinearArrayMask(Nx, Ny, td_x, y_center, n_e, elem_w_pix, pitch_pix)
+
+        # === 시간 옵션 ===
+        c0 = float(np.min(velocity_map))
+        CFL = 0.10
+        depth_m = Lx_cm * 1e-2
+        t_end = 2*depth_m/c0 * 1.2
+
+        # --- Define time array using kgrid ---
+        kgrid.makeTime(c0, CFL, t_end)
+        dt_actual = float(kgrid.dt)
+        Nt_actual = int(kgrid.Nt)
+
+        sim_opts = SimulationOptions(
+            pml_inside=False,
+            pml_size=14,
+            pml_alpha=5.0,
+            data_cast=device,
+            save_to_disk=True
+        )
+        exec_opts = SimulationExecutionOptions(is_gpu_simulation=True)
+
+        # === MB 트랙 ===
+        # Spawn & move **only** where HU==0 (after clipping, this is water/soft).
+        mask_water_spawn = (skull_clipped == 0.0)
+        K = 100  # adjust as needed
+        tracks = make_mb_tracks_rand_avoid_bone(
+            mask_water_spawn, T, K, rng=np.random.default_rng(1234)
+        )
+
+        # (dt_actual, Nt_actual are now defined from kgrid.makeTime)
+
+        # === 프레임/각도 루프 ===
+        for t in range(1, T+1):
+            # Use physical gas-like bubbles with soft edge (defaults ~1 px radius, 0.75 px ramp)
+            c_t, rho_t = apply_mb_disks_physical(velocity_map, density_map, tracks[t-1])
+
+            # Note: Very large K or r_pix may cause strong reflections at simulation boundaries.
+            medium_t = kWaveMedium(
+                sound_speed=c_t.astype(np.float32),
+                density=rho_t.astype(np.float32),
+                alpha_coeff=attenuation_map.astype(np.float32),
+                alpha_power=1.5
+            )
+
+            for th in angles:
+                # --- Build fresh source/sensor each run (k-Wave mutates masks) ---
+                source = kSource()
+                # ensure mask has correct shape and Fortran layout; dtype must be boolean
+                amask = array_mask
+                if amask.shape != (kgrid.Nx, kgrid.Ny):
+                    if amask.shape == (kgrid.Ny, kgrid.Nx):
+                        amask = amask.T
+                    else:
+                        raise ValueError(f"array_mask shape {amask.shape} incompatible with grid {(kgrid.Nx, kgrid.Ny)}")
+                # Cast to bool and force Fortran order (column-major)
+                amask = np.asfortranarray(amask.astype(np.bool_))
+                source.p_mask = amask
+
+                sensor = kSensor()
+                sensor.mask = np.asfortranarray(amask.copy(order='F'))
+                sensor.record = ['p']
+
+                # 요소별 지연 (dt는 위에서 얻은 dt_actual 사용)
+                d_pw = plane_wave_delays(yc, th, dy, 1500.0, dt_actual)
+
+                # per-pixel 지연 (mask의 column-major 순서)
+                idx_mask = np.flatnonzero(source.p_mask.ravel(order='F'))
+                Ny_tmp = source.p_mask.shape[1]
+                delay_by_col = np.zeros((Ny_tmp,), dtype=np.int64)
+                for e in range(n_e):
+                    y0, y1 = elem_cols[e,0], elem_cols[e,1]
+                    delay_by_col[(y0-1):y1] = d_pw[e]
+                _, cols_m = np.unravel_index(idx_mask, (Nx, Ny_tmp), order='F')
+                offs_pix = delay_by_col[cols_m]    # [M]
+                if offs_pix.size != np.count_nonzero(source.p_mask):
+                    print(f"[dbg] offs_pix={offs_pix.size}, nnz(mask)={np.count_nonzero(source.p_mask)}")
+
+                # 송신 파형(sig) — Nt 길이에 맞춤 (항상 1D 보장)
+                sig = p_amp * tone_burst(1.0/dt_actual, freq, cycles)
+                sig = np.asarray(sig, dtype=np.float32)
+                sig = np.squeeze(sig)
+                if sig.ndim != 1:
+                    sig = sig.ravel()
+                Lsig = sig.shape[0]
+                if Lsig < Nt_actual:
+                    sig = np.pad(sig, (0, Nt_actual - Lsig))
                 else:
-                    raise ValueError(f"array_mask shape {amask.shape} incompatible with grid {(kgrid.Nx, kgrid.Ny)}")
-            # Cast to bool and force Fortran order (column-major)
-            amask = np.asfortranarray(amask.astype(np.bool_))
-            source.p_mask = amask
+                    sig = sig[:Nt_actual]
+                # sig: shape (Nt_actual,)
 
-            sensor = kSensor()
-            sensor.mask = np.asfortranarray(amask.copy(order='F'))
-            sensor.record = ['p']
+                # source.p initially built as [Nt × M] for convenience
+                M = idx_mask.size
+                P = np.zeros((Nt_actual, M), dtype=np.float32)
+                for m in range(M):
+                    d = int(max(0, offs_pix[m]))
+                    ncopy = min(sig.size, Nt_actual - d)
+                    if ncopy > 0:
+                        P[d:d+ncopy, m] = sig[:ncopy]
 
-            # 요소별 지연 (dt는 위에서 얻은 dt_actual 사용)
-            d_pw = plane_wave_delays(yc, th, dy, 1500.0, dt_actual)
+                # --- Prepare for k-Wave: expects [num_series x Nt] = [M_mask x Nt] ---
+                M_mask = int(np.count_nonzero(source.p_mask))
+                Nt_k = int(kgrid.Nt)
+                if P.shape[1] != M_mask:
+                    raise ValueError(f"columns(P)={P.shape[1]} != nnz(mask)={M_mask}")
+                if P.shape[0] != Nt_k:
+                    # adjust to simulation Nt if needed
+                    if P.shape[0] > Nt_k:
+                        P = P[:Nt_k, :]
+                    else:
+                        P = np.pad(P, ((0, Nt_k - P.shape[0]), (0, 0)))
 
-            # per-pixel 지연 (mask의 column-major 순서)
-            idx_mask = np.flatnonzero(source.p_mask.ravel(order='F'))
-            Ny_tmp = source.p_mask.shape[1]
-            delay_by_col = np.zeros((Ny_tmp,), dtype=np.int64)
-            for e in range(n_e):
-                y0, y1 = elem_cols[e,0], elem_cols[e,1]
-                delay_by_col[(y0-1):y1] = d_pw[e]
-            _, cols_m = np.unravel_index(idx_mask, (Nx, Ny_tmp), order='F')
-            offs_pix = delay_by_col[cols_m]    # [M]
-            if offs_pix.size != np.count_nonzero(source.p_mask):
-                print(f"[dbg] offs_pix={offs_pix.size}, nnz(mask)={np.count_nonzero(source.p_mask)}")
+                # Transpose to [M_mask x Nt] and ensure float32 contiguous
+                P_kw = np.asarray(P.T, dtype=np.float32, order='C')
+                assert P_kw.shape == (M_mask, Nt_k), f"final source.p shape {P_kw.shape} != ({M_mask}, {Nt_k})"
+                source.p = P_kw
 
-            # 송신 파형(sig) — Nt 길이에 맞춤 (항상 1D 보장)
-            sig = p_amp * tone_burst(1.0/dt_actual, freq, cycles)
-            sig = np.asarray(sig, dtype=np.float32)
-            sig = np.squeeze(sig)
-            if sig.ndim != 1:
-                sig = sig.ravel()
-            Lsig = sig.shape[0]
-            if Lsig < Nt_actual:
-                sig = np.pad(sig, (0, Nt_actual - Lsig))
-            else:
-                sig = sig[:Nt_actual]
-            # sig: shape (Nt_actual,)
+                # 실행
+                out = run2d(kgrid, source, sensor, medium_t, sim_opts, exec_opts)
+                rf_pix = out['p']                 # [Nt, M]
+                dt_out = float(out['dt'])
 
-            # source.p initially built as [Nt × M] for convenience
-            M = idx_mask.size
-            P = np.zeros((Nt_actual, M), dtype=np.float32)
-            for m in range(M):
-                d = int(max(0, offs_pix[m]))
-                ncopy = min(sig.size, Nt_actual - d)
-                if ncopy > 0:
-                    P[d:d+ncopy, m] = sig[:ncopy]
+                # 픽셀→128채널 평균
+                Nt_samp = rf_pix.shape[0]
+                RF128 = np.zeros((Nt_samp, n_e), dtype=np.float32)
+                pix_counts = (elem_cols[:,1] - elem_cols[:,0] + 1).astype(int)
+                ptr = 0
+                for e in range(n_e):
+                    w = pix_counts[e]
+                    RF128[:, e] = rf_pix[:, ptr:ptr+w].mean(axis=1)
+                    ptr += w
 
-            # --- Prepare for k-Wave: expects [num_series x Nt] = [M_mask x Nt] ---
-            M_mask = int(np.count_nonzero(source.p_mask))
-            Nt_k = int(kgrid.Nt)
-            if P.shape[1] != M_mask:
-                raise ValueError(f"columns(P)={P.shape[1]} != nnz(mask)={M_mask}")
-            if P.shape[0] != Nt_k:
-                # adjust to simulation Nt if needed
-                if P.shape[0] > Nt_k:
-                    P = P[:Nt_k, :]
-                else:
-                    P = np.pad(P, ((0, Nt_k - P.shape[0]), (0, 0)))
-
-            # Transpose to [M_mask x Nt] and ensure float32 contiguous
-            P_kw = np.asarray(P.T, dtype=np.float32, order='C')
-            assert P_kw.shape == (M_mask, Nt_k), f"final source.p shape {P_kw.shape} != ({M_mask}, {Nt_k})"
-            source.p = P_kw
-
-            # 실행
-            out = run2d(kgrid, source, sensor, medium_t, sim_opts, exec_opts)
-            rf_pix = out['p']                 # [Nt, M]
-            dt_out = float(out['dt'])
-
-            # 픽셀→128채널 평균
-            Nt_samp = rf_pix.shape[0]
-            RF128 = np.zeros((Nt_samp, n_e), dtype=np.float32)
-            pix_counts = (elem_cols[:,1] - elem_cols[:,0] + 1).astype(int)
-            ptr = 0
-            for e in range(n_e):
-                w = pix_counts[e]
-                RF128[:, e] = rf_pix[:, ptr:ptr+w].mean(axis=1)
-                ptr += w
-
-            savemat(os.path.join(OUT_RF_DIR, f"rf_t{t:02d}_a{th:+03d}.mat"),
-                    {'RF128': RF128, 'dt': dt_out, 'freq': freq, 'angles': np.array([th])},
-                    do_compression=True)
-        print(f"Frame {t}/{T} done.")
+                skull_id = os.path.splitext(os.path.basename(npy_path))[0]
+                savemat(os.path.join(OUT_RF_DIR, f"{skull_id}_t{t:02d}_a{th:+03d}.mat"),
+                        {'RF128': RF128, 'dt': dt_out, 'freq': freq, 'angles': np.array([th])},
+                        do_compression=True)
+            print(f"Frame {t}/{T} done.")
 
 
 if __name__ == "__main__":
